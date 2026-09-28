@@ -400,24 +400,37 @@ class AudioOrSilence:
     def _waveform(audio):
         """The AUDIO that is actually there, or None.
 
-        VHS hands audio on lazily in some versions — a callable that reads the
-        track when something asks for it — and returns an empty tensor rather
-        than None in others, so neither "is None" nor truthiness is enough on
-        its own.
+        VHS hands audio on lazily, and in more than one shape: a callable in
+        some versions, a mapping in others whose `waveform` key shells out to
+        ffmpeg on first read. A clip with no audio stream therefore does not
+        arrive as None — it arrives as something that raises when touched:
+
+            Output file does not contain any stream
+            Error opening output files: Invalid argument
+
+        So every access here is guarded, not just the None check. Older builds
+        also return an empty tensor rather than raising, which is the third
+        case below.
         """
         if audio is None:
             return None
-        if callable(audio):
-            try:
+        try:
+            if callable(audio):
                 audio = audio()
-            except Exception:
+            if audio is None:
                 return None
-        if audio is None:
+            # Reading the key is what runs ffmpeg; `in` can trigger it too.
+            waveform = audio["waveform"]
+            if waveform is None or waveform.numel() == 0:
+                return None
+            # Materialise it here, inside the guard, so a lazy map cannot
+            # raise later in the graph where nothing is watching for it.
+            return {"waveform": waveform,
+                    "sample_rate": int(audio["sample_rate"])}
+        except Exception as exc:
+            print(f"[AudioOrSilence] no usable audio track ({exc}); "
+                  "substituting silence")
             return None
-        waveform = audio.get("waveform") if isinstance(audio, dict) else None
-        if waveform is None or waveform.numel() == 0:
-            return None
-        return audio
 
     @staticmethod
     def _length(audio):
