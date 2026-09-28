@@ -340,13 +340,101 @@ class FaceBoxesPickObject:
         return (str(best), best, overlap)
 
 
+class AudioOrSilence:
+    """Give the graph an audio track even when the clip has none.
+
+    H3 is an audio-video model: the source audio is encoded and concatenated
+    into the latent that gets sampled, so every node downstream of
+    `VHS_LoadVideo`'s AUDIO output needs something to work with. A clip from a
+    GIF provider has no audio stream at all — Giphy and Tenor renditions are
+    video-only — and neither does a phone clip recorded with the mic off, so
+    `VHS_LoadVideo` hands on None and the run dies before sampling.
+
+    Put this between the loader and the rest of the audio chain. Real audio
+    passes through untouched; when there is none, it returns silence of the
+    length the video needs. `frame_count` and `fps` override `seconds` when
+    both are given, so a caller that knows the window in frames need not work
+    the duration out itself.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seconds": ("FLOAT", {"default": 10.0, "min": 0.1,
+                                      "max": 3600.0, "step": 0.1}),
+                "sample_rate": ("INT", {"default": 44100, "min": 8000,
+                                        "max": 192000}),
+                "channels": ("INT", {"default": 2, "min": 1, "max": 2}),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+                "frame_count": ("INT", {"default": 0, "min": 0,
+                                        "max": 100000}),
+                "fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0,
+                                  "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "BOOLEAN", "FLOAT")
+    RETURN_NAMES = ("audio", "was_silent", "seconds")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, seconds, sample_rate, channels, audio=None,
+            frame_count=0, fps=0.0):
+        existing = self._waveform(audio)
+        if existing is not None:
+            return (existing, False, self._length(existing))
+
+        if frame_count > 0 and fps > 0:
+            seconds = frame_count / float(fps)
+        samples = max(1, int(round(seconds * sample_rate)))
+        silence = {
+            "waveform": torch.zeros(1, channels, samples),
+            "sample_rate": int(sample_rate),
+        }
+        return (silence, True, float(samples) / sample_rate)
+
+    @staticmethod
+    def _waveform(audio):
+        """The AUDIO that is actually there, or None.
+
+        VHS hands audio on lazily in some versions — a callable that reads the
+        track when something asks for it — and returns an empty tensor rather
+        than None in others, so neither "is None" nor truthiness is enough on
+        its own.
+        """
+        if audio is None:
+            return None
+        if callable(audio):
+            try:
+                audio = audio()
+            except Exception:
+                return None
+        if audio is None:
+            return None
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        if waveform is None or waveform.numel() == 0:
+            return None
+        return audio
+
+    @staticmethod
+    def _length(audio):
+        waveform = audio["waveform"]
+        rate = float(audio.get("sample_rate") or 1)
+        return float(waveform.shape[-1]) / rate
+
+
 NODE_CLASS_MAPPINGS = {
     "FaceBoxesToMask": FaceBoxesToMask,
     "FaceBoxesOverlap": FaceBoxesOverlap,
     "FaceBoxesPickObject": FaceBoxesPickObject,
+    "AudioOrSilence": AudioOrSilence,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FaceBoxesToMask": "Face Boxes to Mask",
     "FaceBoxesOverlap": "Face Boxes Overlap",
     "FaceBoxesPickObject": "Face Boxes Pick SAM3 Object",
+    "AudioOrSilence": "Audio or Silence",
 }
