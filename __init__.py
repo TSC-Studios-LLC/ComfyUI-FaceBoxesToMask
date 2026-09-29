@@ -439,15 +439,135 @@ class AudioOrSilence:
         return float(waveform.shape[-1]) / rate
 
 
+class FaceBoxesFrameGate:
+    """Keep SAM3's mask, but only while the chosen face is on screen.
+
+    SAM3 tracks a head, not a person. In a clip where one talking head is
+    replaced by another in the same framing — a line-up, an interview reel —
+    it carries a single object through all of them, so pinning `object_indices`
+    to that object masks everyone in turn and the swap lands on every face.
+
+    The app's JSON knows better: it tracks identities, and says which frames
+    each one appears in. This gates the mask with that, and nothing else — the
+    silhouette stays exactly as SAM3 drew it, because SAM3 is better at where
+    a head ends than a rectangle ever is. Frames where the face is absent are
+    zeroed; frames where it is present pass through untouched, so a rectangle
+    the detector missed inside a span costs nothing.
+
+    `hold` bridges gaps of that many frames, for a detector that drops a frame
+    here and there; `pad` keeps the mask alive either side of a span, so a
+    swap does not snap off mid-blink.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "masks": ("MASK",),
+                "detection_json": ("STRING", {"multiline": True}),
+                "face_id": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "source_fps": ("FLOAT", {"default": 24.0, "min": 1.0,
+                                         "max": 240.0, "step": 0.01}),
+                "target_fps": ("FLOAT", {"default": 24.0, "min": 1.0,
+                                         "max": 240.0, "step": 0.01}),
+                "frame_offset": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                "hold": ("INT", {"default": 12, "min": 0, "max": 240}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "INT", "STRING")
+    RETURN_NAMES = ("masks", "kept_frames", "spans")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, masks, detection_json, face_id, source_fps, target_fps,
+            frame_offset, hold):
+        frames = masks.shape[0]
+        present = self._present(detection_json, face_id, source_fps,
+                                target_fps, frame_offset, frames, hold)
+        if not any(present):
+            raise ValueError(
+                f"face {face_id} appears in none of these {frames} frames; "
+                "nothing would be swapped")
+        gated = masks.clone()
+        for index, keep in enumerate(present):
+            if not keep:
+                gated[index] = 0.0
+        return (gated, sum(present), self._spans(present))
+
+    @staticmethod
+    def _present(payload, face_id, source_fps, target_fps, frame_offset,
+                 frames, hold):
+        """Which of the loaded frames have this face, in the loaded rate.
+
+        Only positive evidence counts. The JSON records what the detector saw;
+        it never says a face is *not* somewhere, so a frame it says nothing
+        about means "not seen", which is not the same as "not there" — the
+        detector drops frames, especially on blinks, turns and motion blur.
+
+        So the gate opens on a sighting and closes only where there has been
+        none for a while: `hold` frames of silence are treated as the same
+        appearance continuing. A missed frame in the middle of someone's turn
+        costs nothing; a face that genuinely left closes after `hold` frames.
+
+        Nothing is added beyond the outermost sightings. On a clip that cuts
+        straight from one person to the next — a line-up, an interview reel —
+        every frame of slack lands on somebody else's face.
+        """
+        _ids, boxes = _parse(payload)
+        scale = float(target_fps) / float(source_fps or target_fps)
+        seen = [False] * frames
+        for source_frame in boxes.get(int(face_id), {}):
+            # The JSON counts frames in the clip's own rate; the graph loads at
+            # another, so one source frame covers a span of loaded frames.
+            start = int(round(source_frame * scale)) - frame_offset
+            end = int(round((source_frame + 1) * scale)) - frame_offset
+            for index in range(max(0, start), min(frames, max(end, start + 1))):
+                seen[index] = True
+        return FaceBoxesFrameGate._bridge(seen, hold)
+
+    @staticmethod
+    def _bridge(seen, hold):
+        """Fill gaps shorter than `hold` between two sightings."""
+        filled = list(seen)
+        if hold <= 0:
+            return filled
+        last = None
+        for index, value in enumerate(filled):
+            if not value:
+                continue
+            if last is not None and index - last <= hold + 1:
+                for gap in range(last + 1, index):
+                    filled[gap] = True
+            last = index
+        return filled
+
+    @staticmethod
+    def _spans(present):
+        """The kept ranges, for the log: "0-23, 48-61"."""
+        spans, start = [], None
+        for index, value in enumerate(present):
+            if value and start is None:
+                start = index
+            elif not value and start is not None:
+                spans.append(f"{start}-{index - 1}")
+                start = None
+        if start is not None:
+            spans.append(f"{start}-{len(present) - 1}")
+        return ", ".join(spans)
+
+
 NODE_CLASS_MAPPINGS = {
     "FaceBoxesToMask": FaceBoxesToMask,
     "FaceBoxesOverlap": FaceBoxesOverlap,
     "FaceBoxesPickObject": FaceBoxesPickObject,
     "AudioOrSilence": AudioOrSilence,
+    "FaceBoxesFrameGate": FaceBoxesFrameGate,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FaceBoxesToMask": "Face Boxes to Mask",
     "FaceBoxesOverlap": "Face Boxes Overlap",
     "FaceBoxesPickObject": "Face Boxes Pick SAM3 Object",
     "AudioOrSilence": "Audio or Silence",
+    "FaceBoxesFrameGate": "Face Boxes Frame Gate",
 }
